@@ -7,7 +7,6 @@
 
 #include <drm/drm_atomic_helper.h>
 #include <drm/drm_framebuffer.h>
-#include <drm/drm_plane_helper.h>
 #include <drm/drm_modes.h>
 
 #include "test-drm_modeset_common.h"
