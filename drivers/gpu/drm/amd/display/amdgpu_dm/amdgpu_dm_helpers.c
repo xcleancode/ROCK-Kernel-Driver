@@ -312,6 +312,8 @@ bool dm_helpers_dp_mst_send_payload_allocation(
 	struct amdgpu_dm_connector *aconnector;
 	struct drm_dp_mst_topology_mgr *mst_mgr;
 	struct drm_dp_mst_port *mst_port;
+	enum mst_progress_status set_flag = MST_ALLOCATE_NEW_PAYLOAD;
+	enum mst_progress_status clr_flag = MST_CLEAR_ALLOCATED_PAYLOAD;
 
 	aconnector = (struct amdgpu_dm_connector *)stream->dm_stream_context;
 
@@ -325,8 +327,20 @@ bool dm_helpers_dp_mst_send_payload_allocation(
 	if (!mst_mgr->mst_state)
 		return false;
 
-	/* It's OK for this to fail */
-	drm_dp_update_payload_part2(mst_mgr);
+	if (!enable) {
+		set_flag = MST_CLEAR_ALLOCATED_PAYLOAD;
+		clr_flag = MST_ALLOCATE_NEW_PAYLOAD;
+	}
+
+	if (drm_dp_update_payload_part2(mst_mgr)) {
+		amdgpu_dm_set_mst_status(&aconnector->mst_status,
+			set_flag, false);
+	} else {
+		amdgpu_dm_set_mst_status(&aconnector->mst_status,
+			set_flag, true);
+		amdgpu_dm_set_mst_status(&aconnector->mst_status,
+			clr_flag, false);
+	}
 
 	if (!enable)
 		drm_dp_mst_deallocate_vcpi(mst_mgr, mst_port);
@@ -451,7 +465,6 @@ bool dm_helpers_dp_mst_stop_top_mgr(
 		struct dc_link *link)
 {
 	struct amdgpu_dm_connector *aconnector = link->priv;
-	uint8_t i;
 
 	if (!aconnector) {
 		DRM_ERROR("Failed to find connector for link!");
@@ -463,22 +476,7 @@ bool dm_helpers_dp_mst_stop_top_mgr(
 
 	if (aconnector->mst_mgr.mst_state == true) {
 		drm_dp_mst_topology_mgr_set_mst(&aconnector->mst_mgr, false);
-
-		for (i = 0; i < MAX_SINKS_PER_LINK; i++) {
-			if (link->remote_sinks[i] == NULL)
-				continue;
-
-			if (link->remote_sinks[i]->sink_signal ==
-			    SIGNAL_TYPE_DISPLAY_PORT_MST) {
-				dc_link_remove_remote_sink(link, link->remote_sinks[i]);
-
-				if (aconnector->dc_sink) {
-					dc_sink_release(aconnector->dc_sink);
-					aconnector->dc_sink = NULL;
-					aconnector->dc_link->cur_link_settings.lane_count = 0;
-				}
-			}
-		}
+		link->cur_link_settings.lane_count = 0;
 	}
 
 	return false;
@@ -571,7 +569,7 @@ static bool execute_synaptics_rc_command(struct drm_dp_aux *aux,
 	unsigned char rc_cmd = 0;
 	unsigned char rc_result = 0xFF;
 	unsigned char i = 0;
-	uint8_t ret = 0;
+	int ret;
 
 	if (is_write_cmd) {
 		// write rc data
@@ -731,8 +729,14 @@ bool dm_helpers_dp_write_dsc_enable(
 		const struct dc_stream_state *stream,
 		bool enable)
 {
-	uint8_t enable_dsc = enable ? 1 : 0;
+	static const uint8_t DSC_DISABLE;
+	static const uint8_t DSC_DECODING = 0x01;
+	static const uint8_t DSC_PASSTHROUGH = 0x02;
+
 	struct amdgpu_dm_connector *aconnector;
+	struct drm_dp_mst_port *port;
+	uint8_t enable_dsc = enable ? DSC_DECODING : DSC_DISABLE;
+	uint8_t enable_passthrough = enable ? DSC_PASSTHROUGH : DSC_DISABLE;
 	uint8_t ret = 0;
 
 	if (!stream)
@@ -752,8 +756,39 @@ bool dm_helpers_dp_write_dsc_enable(
 				aconnector->dsc_aux, stream, enable_dsc);
 #endif
 
-		ret = drm_dp_dpcd_write(aconnector->dsc_aux, DP_DSC_ENABLE, &enable_dsc, 1);
-		DC_LOG_DC("Send DSC %s to MST RX\n", enable_dsc ? "enable" : "disable");
+		port = aconnector->port;
+
+		if (enable) {
+			if (port->passthrough_aux) {
+				ret = drm_dp_dpcd_write(port->passthrough_aux,
+							DP_DSC_ENABLE,
+							&enable_passthrough, 1);
+				DC_LOG_DC("Sent DSC pass-through enable to virtual dpcd port, ret = %u\n",
+					  ret);
+			}
+
+			ret = drm_dp_dpcd_write(aconnector->dsc_aux,
+						DP_DSC_ENABLE, &enable_dsc, 1);
+			DC_LOG_DC("Sent DSC decoding enable to %s port, ret = %u\n",
+				  (port->passthrough_aux) ? "remote RX" :
+				  "virtual dpcd",
+				  ret);
+		} else {
+			ret = drm_dp_dpcd_write(aconnector->dsc_aux,
+						DP_DSC_ENABLE, &enable_dsc, 1);
+			DC_LOG_DC("Sent DSC decoding disable to %s port, ret = %u\n",
+				  (port->passthrough_aux) ? "remote RX" :
+				  "virtual dpcd",
+				  ret);
+
+			if (port->passthrough_aux) {
+				ret = drm_dp_dpcd_write(port->passthrough_aux,
+							DP_DSC_ENABLE,
+							&enable_passthrough, 1);
+				DC_LOG_DC("Sent DSC pass-through disable to virtual dpcd port, ret = %u\n",
+					  ret);
+			}
+		}
 	}
 
 	if (stream->signal == SIGNAL_TYPE_DISPLAY_PORT || stream->signal == SIGNAL_TYPE_EDP) {
@@ -770,7 +805,7 @@ bool dm_helpers_dp_write_dsc_enable(
 #endif
 	}
 
-	return (ret > 0);
+	return ret;
 }
 
 bool dm_helpers_is_dp_sink_present(struct dc_link *link)
